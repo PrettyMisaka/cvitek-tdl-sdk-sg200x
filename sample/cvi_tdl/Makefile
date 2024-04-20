@@ -62,11 +62,12 @@ AR = $(CROSS_COMPILE)ar
 LD = $(CROSS_COMPILE)ld
 STRIP = $(CROSS_COMPILE)strip
 
-ifeq ($(DEBUG), 1)
+#DEBUG = 1
+#ifeq ($(DEBUG), 1)
 CFLAGS += -g -O0
-else
-CFLAGS += -O3 -DNDEBUG
-endif
+#else
+#CFLAGS += -O3 -DNDEBUG
+#endif
 
 #####################################################
 # Middleware stuffs
@@ -235,7 +236,8 @@ CFLAGS += -I$(SDK_INC_PATH) \
 		  -I$(MW_LINUX_INC_PATH) \
 		  -I$(MW_INC_PATH) \
 		  -I$(MW_INC_PATH)/linux \
-          -I$(AISDK_ROOT_PATH)/include/stb
+          -I$(AISDK_ROOT_PATH)/include/stb \
+	  -I/home/lyy/milkv-sdk/duo-examples/ffmpeg/output/include #ffmpeg
 
 ifeq ($(CONFIRM_ENV_VAR), 1)
 $(info ---------------------------------------)
@@ -266,12 +268,15 @@ TARGETS_IMAGE_SAMPLE += $(shell find . -type f -name 'sample_read_*.cpp' -exec b
 TARGETS_APP_SAMPLE := $(shell find . -type f -name 'sample_app_*.c' -exec basename {} .c ';')
 TARGETS_YOLO_SAMPLE := $(shell find . -type f -name 'sample_yolo*.cpp' -exec basename {} .cpp ';')
 
+TARGETS_MY_SAMPLE :=  $(shell find . -type f -name 'sample_my_*.c' -exec basename {} .c ';')
+
 TARGETS = $(TARGETS_SAMPLE_INIT) \
   	      $(TARGETS_VI_SAMPLE) \
  	      $(TARGETS_AUDIO_SAMPLE) \
 	      $(TARGETS_READ_SAMPLE) \
 	      $(TARGETS_APP_SAMPLE) \
-	      $(TARGETS_YOLO_SAMPLE)
+	      $(TARGETS_YOLO_SAMPLE) \
+	      $(TARGETS_MY_SAMPLE)
 
 .PHONY : all clean
 
@@ -305,7 +310,14 @@ sample_vi_%: $(PWD)/sample_vi_%.o \
 			 $(SDK_ROOT_PATH)/sample/utils/sample_utils.o \
 			 $(SDK_ROOT_PATH)/sample/utils/middleware_utils.o \
 			 $(SAMPLE_COMMON_FILE)
-	$(CC) $(CFLAGS) $(SAMPLE_APP_LIBS) -o $@ $^
+	$(CC) $(CFLAGS) -g $(SAMPLE_APP_LIBS) -o $@ $^
+
+sample_my_%: $(PWD)/sample_my_%.o \
+			 $(SDK_ROOT_PATH)/sample/utils/vi_vo_utils.o \
+			 $(SDK_ROOT_PATH)/sample/utils/sample_utils.o \
+			 $(SDK_ROOT_PATH)/sample/utils/middleware_utils.o \
+			 $(SAMPLE_COMMON_FILE)
+	$(CC) $(CFLAGS) -g $(SAMPLE_APP_LIBS) -o $@ $^ -L/home/lyy/milkv-sdk/duo-examples/ffmpeg/output/lib -lswscale -lx264 -lpostproc -lswresample -lavfilter -lavcodec -lavformat -lavutil -lavdevice
 
 sample_init: $(PWD)/sample_init.o
 	$(CC) $(CFLAGS) $(SAMPLE_LIBS) -o $@ $^
