@@ -204,7 +204,7 @@ MD_INC_PATH = $(SDK_ROOT_PATH)/include/cvi_md
 DRAW_RECT_INC_PATH = $(SDK_ROOT_PATH)/include/cvi_draw_rect
 PREPROCESS_INC_PATH = $(SDK_ROOT_PATH)/include/cvi_preprocess
 
-CFLAGS += -std=gnu11 -Wno-pointer-to-int-cast -fsigned-char -Werror=all -Wno-format-truncation -fdiagnostics-color=always -s
+CFLAGS += -std=gnu11 -Wno-pointer-to-int-cast -fsigned-char -Werror=all -Wno-format-truncation -fdiagnostics-color=always #-s
 
 SRCS := $(wildcard $(PWD)/*.c)
 CPPS := $(wildcard $(PWD)/*.cpp)
@@ -317,7 +317,7 @@ sample_my_%: $(PWD)/sample_my_%.o \
 			 $(SDK_ROOT_PATH)/sample/utils/sample_utils.o \
 			 $(SDK_ROOT_PATH)/sample/utils/middleware_utils.o \
 			 $(SAMPLE_COMMON_FILE)
-	$(CC) $(CFLAGS) -g $(SAMPLE_APP_LIBS) -o $@ $^ -L/home/lyy/milkv-sdk/duo-examples/ffmpeg/output/lib -lswscale -lx264 -lpostproc -lswresample -lavfilter -lavcodec -lavformat -lavutil -lavdevice
+	$(CC) $(CFLAGS) $(SAMPLE_APP_LIBS) -g -o $@ $^ -L/home/lyy/milkv-sdk/duo-examples/ffmpeg/output/lib -lswscale -lx264 -lpostproc -lswresample -lavfilter -lavcodec -lavformat -lavutil -lavdevice
 
 sample_init: $(PWD)/sample_init.o
 	$(CC) $(CFLAGS) $(SAMPLE_LIBS) -o $@ $^

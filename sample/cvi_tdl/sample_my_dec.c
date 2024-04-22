@@ -41,7 +41,10 @@
 // #define VDEC_PIXEL_FORMAT PIXEL_FORMAT_RGB_888
 #define _UNUSED __attribute__((unused))
 
+#define IGN_SIGSEGV
+
 static volatile bool bStopCtl = false;
+static volatile bool bReleaseSendFrame = false;
 static char *fbp;
 
 static _UNUSED int lcd_init(){
@@ -76,8 +79,16 @@ static _UNUSED int lcd_init(){
 static void SampleHandleSig(CVI_S32 signo) {
   signal(SIGINT, SIG_IGN);
   signal(SIGTERM, SIG_IGN);
+#ifdef IGN_SIGSEGV
+  signal(SIGSEGV, SIG_IGN);
+#endif
   printf("handle signal, signo: %d\n", signo);
-  if (SIGINT == signo || SIGTERM == signo) {
+  if (SIGINT == signo || SIGTERM == signo 
+#ifdef IGN_SIGSEGV
+  || SIGSEGV == signo
+#endif
+  ) {
+    printf("info signo:%d\n",signo);
     bStopCtl = true;
   }
 }
@@ -226,6 +237,47 @@ static CVI_S32 setVdecThreadParm(VDEC_THREAD_PARAM_S *vdecThreadParm, char *file
 	vdecThreadParm->u64PtsInit		= 0					;
     vdecThreadParm->s32IntervalTime = 33*1000           ;
 	return CVI_SUCCESS;
+}
+_UNUSED static SIZE_S getVideoWH(char *filePath){
+    SIZE_S size = {
+        .u32Height = 0,
+        .u32Width = 0
+    };
+    
+    AVCodecParameters *origin_par = NULL;
+    AVFormatContext *fmt_ctx = NULL;
+    int result, video_stream;
+
+    result = avformat_open_input(&fmt_ctx, filePath, NULL, NULL);
+    if (result < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Can't open file\n");
+        goto get_video_info_err;
+    }
+
+    result = avformat_find_stream_info(fmt_ctx, NULL);
+    if (result < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Can't get stream info\n");
+        goto get_video_info_err;
+    }
+
+    video_stream = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    if (video_stream < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Can't find video stream in input file\n");
+        goto get_video_info_err;
+    }
+
+    origin_par = fmt_ctx->streams[video_stream]->codecpar;
+
+    size.u32Height = origin_par->height;
+    size.u32Width = origin_par->width;
+
+    avformat_close_input(&fmt_ctx);
+
+    return size;
+
+get_video_info_err:
+    return size;
+
 }
 _UNUSED static void *sendFrame();
 _UNUSED static CVI_VOID startVdecFrameSendThread(pthread_t *pVdecThread,VDEC_THREAD_PARAM_S *pstVdecSend)
@@ -464,7 +516,7 @@ _UNUSED static void *sendFrame(CVI_VOID *pArgs){
             stStream.u32Len     = 0 ;
         }
 SendAgain:
-        s32Ret = CVI_VDEC_SendStream(VDEC_CHN0,&stStream,-1);
+        s32Ret = CVI_VDEC_SendStream(VDEC_CHN0,&stStream,2000);
         if(s32Ret != CVI_SUCCESS){
 			usleep(1000);//1ms
             goto SendAgain;
@@ -478,7 +530,7 @@ SendAgain:
     AVCodecContext *ctx= NULL;
     AVCodecParameters *origin_par = NULL;
     // struct SwsContext * my_SwsContext;
-    uint8_t *byte_buffer = NULL;
+    // uint8_t *byte_buffer = NULL;
     AVPacket *pkt;
     AVFormatContext *fmt_ctx = NULL;
     int video_stream;
@@ -542,14 +594,14 @@ SendAgain:
     
     // byte_buffer_size = av_image_get_buffer_size(ctx->pix_fmt, ctx->width, ctx->height, 16);
     byte_buffer_size = av_image_get_buffer_size( AV_PIX_FMT_RGB565LE, 480, 320, 16);
-    byte_buffer = (uint8_t*)fbp;
+    // byte_buffer = (uint8_t*)fbp;
     // byte_buffer = av_malloc(byte_buffer_size);
 
     printf("w:%d h:%d byte_buffer_size:%d\n",ctx->width,ctx->height,byte_buffer_size);
-    if (!byte_buffer) {
-        av_log(NULL, AV_LOG_ERROR, "Can't allocate buffer\n");
-        pthread_exit(NULL);
-    }
+    // if (!byte_buffer) {
+    //     av_log(NULL, AV_LOG_ERROR, "Can't allocate buffer\n");
+    //     pthread_exit(NULL);
+    // }
 
     printf("#tb %d: %d/%d\n", video_stream, fmt_ctx->streams[video_stream]->time_base.num, fmt_ctx->streams[video_stream]->time_base.den);
     i = 0;
@@ -591,7 +643,7 @@ SendAgain:
 
         if (result < 0) {
             av_log(NULL, AV_LOG_ERROR, "Error submitting a packet for decoding\n");
-            pthread_exit(NULL);
+            goto finish;
         }
 
         clock_arr[2] = clock();//----------------------------------------------------------------------------------------------------------
@@ -605,19 +657,26 @@ SendAgain:
     }
 
 finish:
+    bStopCtl = true;
+    while(!bReleaseSendFrame){
+        usleep(100000);
+    };
+	printf("Exit send stream img thread\n");
     av_packet_free(&pkt);
     avformat_close_input(&fmt_ctx);
     avcodec_free_context(&ctx);
-    av_freep(&byte_buffer);
+    // av_freep(&byte_buffer);
     // sws_freeContext(my_SwsContext);
     pthread_exit(NULL);
-    bStopCtl = true;
 }
 
 int main(int argc, char *argv[]){
 
     signal(SIGINT, SampleHandleSig);
     signal(SIGTERM, SampleHandleSig);
+#ifdef IGN_SIGSEGV
+    signal(SIGSEGV, SampleHandleSig);
+#endif
 
 	if(argc == 1) return 0;
 
@@ -627,10 +686,8 @@ int main(int argc, char *argv[]){
 		CVI_SYS_GetVersion(&stVersion);
 		printf("MMF Version:%s\n", stVersion.version);
 	}
-    SIZE_S srcSize = { 
-        .u32Width = 1280,
-        .u32Height = 720
-    };
+    SIZE_S srcSize = getVideoWH(argv[1]);
+    if(srcSize.u32Width == 0 || srcSize.u32Height == 0) return 0;
     SIZE_S dstSize = { 
         .u32Width = 384,
         .u32Height = 288
@@ -690,12 +747,12 @@ int main(int argc, char *argv[]){
 
     pthread_join(getDstImgThread, NULL);
     pthread_join(getSrcImgThread, NULL);
+    bReleaseSendFrame = true;
     pthread_join(sendStreamThread, NULL);
     printf("exit all thread down\n");
     // pthread_join(getDecImgThread, NULL);
 	// SAMPLE_COMM_VDEC_StopGetPic( &vdecThreadParm, &getDecPicThread);
-	
-	vdecThreadParm.eThreadCtrl = THREAD_CTRL_STOP;
+
 	SAMPLE_COMM_VDEC_Stop(VDEC_CHN0);
 
     SAMPLE_COMM_VPSS_Stop(VPSS_GRP0, abChnEnable);
