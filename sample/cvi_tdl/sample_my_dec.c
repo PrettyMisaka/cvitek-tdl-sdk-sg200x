@@ -28,10 +28,13 @@
 
     #include "libavutil/adler32.h"
     #include "libavcodec/avcodec.h"
+    #include "libavcodec/bsf.h"
     #include "libavformat/avformat.h"
     #include "libavutil/imgutils.h"
     #include "libavutil/timestamp.h"
     #include "libswscale/swscale.h"
+
+#include <termios.h>
 
 #define VPSS_GRP0 0
 #define VDEC_CHN0 0
@@ -41,12 +44,59 @@
 // #define VDEC_PIXEL_FORMAT PIXEL_FORMAT_RGB_888
 #define _UNUSED __attribute__((unused))
 
+#define VIDEO_FORWARD_SECONDS 10
+#define VIDEO_BACK_SECONDS 10
+
 #define IGN_SIGSEGV
 
+typedef enum{
+    VIDEO_PLAYING = 0,
+    VIDEO_PAUSE ,
+    VIDEO_BACK  ,
+    VIDEO_FORWARD
+} video_play_status_enum;
+
+typedef struct video_status_ctl{
+    bool en;
+    video_play_status_enum status;
+    int pts_offset;
+}video_status_ctl_typedef;
+
+video_status_ctl_typedef video_status_ctl = {
+    .en = false,
+    .status = VIDEO_PLAYING,
+    .pts_offset = 0
+};
+
+pthread_mutex_t video_status_ctl_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+pthread_mutex_t video_wait_thread_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t video_wait_thread_cond = PTHREAD_COND_INITIALIZER;
+
+pthread_mutex_t video_cmd_thread_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t video_cmd_thread_cond = PTHREAD_COND_INITIALIZER;
+
 static volatile bool bStopCtl = false;
+static volatile bool bWaitCmdDownCtl = false;
+static volatile bool bPauseThread = false;
 static volatile bool bReleaseSendFrame = false;
 static char *fbp;
+static volatile int pts_timebase;
 
+static void thread_wait_cmd_down(pthread_mutex_t* pmutex, pthread_cond_t* pcond, bool *_cond)
+{
+    pthread_mutex_lock(pmutex);
+    while (*_cond) {
+        pthread_cond_wait(pcond, pmutex);
+    }
+    pthread_mutex_unlock(pmutex);
+}
+static void set_video_status_ctl_val(bool en, video_play_status_enum status, int pts_offset, video_status_ctl_typedef* _ctl_status)
+{
+    _ctl_status->en = en;
+    _ctl_status->pts_offset = pts_offset;
+    _ctl_status->status = status;
+}
 static _UNUSED int lcd_init(){
   int fbfd = open("/dev/fb0", O_RDWR);
   if(fbfd == -1) {
@@ -90,7 +140,12 @@ static void SampleHandleSig(CVI_S32 signo) {
   ) {
     printf("info signo:%d\n",signo);
     bStopCtl = true;
-  }
+
+    bPauseThread = false;
+    pthread_mutex_lock(&video_wait_thread_mutex);
+    pthread_cond_broadcast(&video_wait_thread_cond);
+    pthread_mutex_unlock(&video_wait_thread_mutex);
+}
 }
 static CVI_S32 setVdecChnAttr(VDEC_CHN_ATTR_S *pstChnAttr,VDEC_CHN VdecChn,SIZE_S srcSize){
 	VDEC_CHN_PARAM_S stChnParam;
@@ -100,7 +155,8 @@ static CVI_S32 setVdecChnAttr(VDEC_CHN_ATTR_S *pstChnAttr,VDEC_CHN VdecChn,SIZE_
 	pstChnAttr->u32PicHeight = srcSize.u32Height			;
 	pstChnAttr->u32PicWidth = srcSize.u32Width  			;
 	pstChnAttr->u32StreamBufSize = ALIGN(pstChnAttr->u32PicHeight * pstChnAttr->u32PicWidth, 0x4000);
-	CVI_VDEC_MEM("u32StreamBufSize = 0x%X\n", pstChnAttr->u32StreamBufSize);
+	printf("u32StreamBufSize = 0x%X\n", pstChnAttr->u32StreamBufSize);
+    CVI_VDEC_MEM("u32StreamBufSize = 0x%X\n", pstChnAttr->u32StreamBufSize);
 	pstChnAttr->u32FrameBufCnt = 3			;//参考帧+显示帧+1
 	CVI_VDEC_TRACE("VdecChn = %d\n", VdecChn)	;
 
@@ -184,9 +240,6 @@ static CVI_S32 setVpssGrp( VPSS_GRP VpssGrp, CVI_BOOL *abChnEnable, SIZE_S srcSi
 	VPSS_CHN_DEFAULT_HELPER(&astVpssChnAttr[0], srcSize.u32Width, srcSize.u32Height, PIXEL_FORMAT_NV21, true);
 	VPSS_CHN_DEFAULT_HELPER(&astVpssChnAttr[1], dstSize.u32Width, dstSize.u32Height, PIXEL_FORMAT_RGB_888, true);
 
-	// astVpssChnAttr[0].stFrameRate.s32DstFrameRate = 30;
-	// astVpssChnAttr[1].stFrameRate.s32DstFrameRate = 30;
-
 	CVI_VPSS_DestroyGrp(VpssGrp);
 	s32Ret = SAMPLE_COMM_VPSS_Init(VpssGrp, abChnEnable, &stVpssGrpAttr, astVpssChnAttr);
 	if (s32Ret != CVI_SUCCESS) {
@@ -230,7 +283,7 @@ static CVI_S32 setVdecThreadParm(VDEC_THREAD_PARAM_S *vdecThreadParm, char *file
 	memset(vdecThreadParm,0,sizeof(VDEC_THREAD_PARAM_S));
 	snprintf(vdecThreadParm->cFileName, sizeof(vdecThreadParm->cFileName), "%s", filePath);
 	vdecThreadParm->s32ChnId 		= VdecChn			;
-	vdecThreadParm->s32MinBufSize 	= 1024*20      		;
+	vdecThreadParm->s32MinBufSize 	= 1024*50     		;
 	vdecThreadParm->s32StreamMode 	= VDEC_STREAM_MODE	;
 	vdecThreadParm->eThreadCtrl 	= THREAD_CTRL_PAUSE	;
 	vdecThreadParm->s32MilliSec 	= -1				;//阻塞模式
@@ -293,6 +346,18 @@ _UNUSED static CVI_VOID startVdecFrameSendThread(pthread_t *pVdecThread,VDEC_THR
 	pthread_create(pVdecThread, &attr, sendFrame, (CVI_VOID *)pstVdecSend);
     printf("enter send frame thread, path:%s\n",pstVdecSend->cFileName);
 }
+_UNUSED static CVI_VOID startGetdecThread(pthread_t *pVdecThread, void *fun())
+{
+	struct sched_param param;
+	pthread_attr_t attr;
+
+	param.sched_priority = 40;
+	pthread_attr_init(&attr);
+	pthread_attr_setschedpolicy(&attr, SCHED_RR);
+	pthread_attr_setschedparam(&attr, &param);
+	pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+	pthread_create(pVdecThread, &attr, fun, NULL);
+}
 _UNUSED static void lcd_show_rgb565_384_288(char *dstAddr, VIDEO_FRAME_INFO_S stFrame){
   size_t image_size = stFrame.stVFrame.u32Length[0] + stFrame.stVFrame.u32Length[1] +
                       stFrame.stVFrame.u32Length[2];
@@ -331,8 +396,10 @@ static void *getDstImg() {
     CVI_S32 s32Ret;
 
     lcd_init();
-    clock_t time[5];
+    _UNUSED clock_t time[5];
     while (bStopCtl == false) {
+        thread_wait_cmd_down(&video_wait_thread_mutex,&video_wait_thread_cond,&bPauseThread);
+
         time[0] = clock();//----------------------------------------------------------------
         s32Ret = CVI_VPSS_GetChnFrame(VPSS_GRP0, VPSS_CHN1, &stFrame, 2000);
 		if (s32Ret == 0xc006800e) {
@@ -345,6 +412,12 @@ static void *getDstImg() {
             printf("CVI_VPSS_GetChnFrame chn1 failed with %#x\n", s32Ret);
             break;
         }
+
+        printf("get pts = %ld, time:%.2f\n", stFrame.stVFrame.u64PTS, (float)stFrame.stVFrame.u64PTS/pts_timebase);
+		// 将当前光标往上移动一行
+		// printf("\033[A");
+		// //删除光标后面的内容
+		// printf("\033[K");
     
         static bool info_flag = true;
         if(info_flag){
@@ -370,7 +443,7 @@ static void *getDstImg() {
         time[1] = clock();//----------------------------------------------------------------
         lcd_show_rgb565_384_288(fbp,stFrame);
         time[2] = clock();//----------------------------------------------------------------
-        printf("time:%f, show time:%f, precent:%.2f\n", (double)(time[2] - time[0]) / CLOCKS_PER_SEC, (double)(time[2] - time[1]) / CLOCKS_PER_SEC, (double)(time[2] - time[1])/(time[2] - time[0]));
+        // printf("time:%f, show time:%f, precent:%.2f\n", (double)(time[2] - time[0]) / CLOCKS_PER_SEC, (double)(time[2] - time[1]) / CLOCKS_PER_SEC, (double)(time[2] - time[1])/(time[2] - time[0]));
 
     error:
         // CVI_VPSS_ReleaseChnFrame( VPSS_GRP0, VPSS_CHN0, &stFrame);
@@ -383,11 +456,13 @@ static void *getDstImg() {
   printf("Exit get dst img thread\n");
   pthread_exit(NULL);
 }
-static void *getSrcImg() {
+_UNUSED static void *getSrcImg() {
     printf("Enter get src img thread\n");
     VIDEO_FRAME_INFO_S stFrame;
     CVI_S32 s32Ret;
     while (bStopCtl == false) {
+        thread_wait_cmd_down(&video_wait_thread_mutex,&video_wait_thread_cond,&bPauseThread);
+
         s32Ret = CVI_VPSS_GetChnFrame(VPSS_GRP0, VPSS_CHN0, &stFrame, 2000);
 		if (s32Ret == 0xc006800e) {
             // printf("CVI_VPSS_GetChnFrame chn0 failed with %#x\n", s32Ret);
@@ -441,6 +516,8 @@ static _UNUSED void *getDecImg() {
     clock_t time,time_tmp;
     time = clock();
     while (bStopCtl == false) {
+        thread_wait_cmd_down(&video_wait_thread_mutex,&video_wait_thread_cond,&bPauseThread);
+
 		s32Ret = CVI_VDEC_GetFrame( VDEC_CHN0, &stFrame, -1);
 		if (s32Ret == 0xc0058041) {
             // printf("CVI_DEC_GetChnFrame chn1 failed with %#x\n", s32Ret);
@@ -502,12 +579,14 @@ static _UNUSED void *getDecImg() {
 _UNUSED static void *sendFrame(CVI_VOID *pArgs){
 
     // CVI_S32 s32Ret;
-    int _sendStream2Dec(AVPacket *pkt,CVI_BOOL bEndOfStream){
+    int _sendStream2Dec(uint32_t size, unsigned char * data, uint64_t pts,CVI_BOOL bEndOfStream){
         static CVI_S32 s32Ret;
         static VDEC_STREAM_S stStream;
-        stStream.u32Len     = pkt->size ;
-        stStream.pu8Addr    = pkt->data ;
-        stStream.u64PTS     = pkt->pts  ;
+        stStream.u32Len     = size ;
+        // if(stStream.u32Len > 1024*10) 
+        // printf("pkt size:%d\n",size);
+        stStream.pu8Addr    = data ;
+        stStream.u64PTS     = pts  ;
 
         stStream.bDisplay       = true          ;
         stStream.bEndOfFrame    = true          ;
@@ -518,6 +597,7 @@ _UNUSED static void *sendFrame(CVI_VOID *pArgs){
 SendAgain:
         s32Ret = CVI_VDEC_SendStream(VDEC_CHN0,&stStream,2000);
         if(s32Ret != CVI_SUCCESS){
+            // printf("vdec err:0x%x\n",s32Ret);
 			usleep(1000);//1ms
             goto SendAgain;
         }
@@ -538,6 +618,14 @@ SendAgain:
     int i = 0;
     int result;
     static int cnt = 0;
+
+    int video_type = 0;
+    if(1){
+        int file_name_n = strlen(pstVdecThreadParam->cFileName);
+        if(strncmp(&pstVdecThreadParam->cFileName[file_name_n - 3],"mp4",3) == 0)
+            video_type = 1;
+        //mp3
+    }
 
     result = avformat_open_input(&fmt_ctx, pstVdecThreadParam->cFileName, NULL, NULL);
     if (result < 0) {
@@ -604,14 +692,102 @@ SendAgain:
     // }
 
     printf("#tb %d: %d/%d\n", video_stream, fmt_ctx->streams[video_stream]->time_base.num, fmt_ctx->streams[video_stream]->time_base.den);
+    pts_timebase = fmt_ctx->streams[video_stream]->time_base.den;
     i = 0;
+
+
+    AVBSFContext * h264bsfc;
+    uint8_t *h264_fr_buf = NULL;  // 连续的内存空间
+    size_t h264_fr_buf_size = 1024 * 256;  // 初始分配1MB，实际大小可能需要调整
+    size_t pos = 0;  // 跟踪当前写入位置
+    const AVBitStreamFilter * filter;
+    if(video_type){
+        filter = av_bsf_get_by_name("h264_mp4toannexb");
+        av_bsf_alloc(filter, &h264bsfc);
+        avcodec_parameters_copy(h264bsfc->par_in, fmt_ctx->streams[video_stream]->codecpar);
+        
+        av_bsf_init(h264bsfc);
+        h264_fr_buf = (uint8_t *)av_malloc(h264_fr_buf_size);
+    }
+
+    // AVBitStreamFilterContext* h264bsfc =  av_bitstream_filter_init("h264_mp4toannexb"); 
 
     result = 0;
     // int i_clock = 0;
     clock_t clock_arr[10];
     clock_t time, time_tmp;
     time = clock();
+
+    video_status_ctl_typedef _video_status_ctl;
+    video_play_status_enum video_status = VIDEO_PLAYING;
+    bool unBlockingFlag = false;
+    int64_t pts;
     while (result >= 0 && !bStopCtl) {
+
+        unBlockingFlag = false;
+        _video_status_ctl.en = false;
+
+        pthread_mutex_lock(&video_status_ctl_mutex);
+
+        if(bWaitCmdDownCtl){
+            memcpy( &_video_status_ctl, &video_status_ctl, sizeof(video_status_ctl_typedef));
+        }
+
+        pthread_mutex_unlock(&video_status_ctl_mutex);
+
+        if(_video_status_ctl.en && bWaitCmdDownCtl)
+        {
+            int ret;
+            bPauseThread = true;
+            switch (_video_status_ctl.status)
+            {
+            case VIDEO_PLAYING:
+                if(video_status == VIDEO_PAUSE){
+                    unBlockingFlag = true;
+                    video_status = VIDEO_PLAYING;
+                }
+                break;
+            case VIDEO_PAUSE:
+                if(video_status == VIDEO_PLAYING){
+                    video_status = VIDEO_PAUSE;
+                }
+                break;
+            case VIDEO_BACK:
+                unBlockingFlag = true;
+                ret = av_seek_frame(fmt_ctx, video_stream , (int64_t)(pts - _video_status_ctl.pts_offset * pts_timebase), AVSEEK_FLAG_BACKWARD );
+                if(ret < 0){
+                    printf("av_seek_frame failed!!\ntarget:%.2f\n",(float)pts/pts_timebase - _video_status_ctl.pts_offset);
+                }
+                break;
+            case VIDEO_FORWARD:
+                unBlockingFlag = true;
+                ret = av_seek_frame(fmt_ctx, video_stream , (int64_t)(pts + _video_status_ctl.pts_offset * pts_timebase), AVSEEK_FLAG_BACKWARD );
+                if(ret < 0){
+                    printf("av_seek_frame failed!!\ntarget:%.2f\n",(float)pts/pts_timebase + _video_status_ctl.pts_offset);
+                }
+                break;
+            default:
+                break;
+            }
+        }
+
+        if(bWaitCmdDownCtl){
+            bWaitCmdDownCtl = false;
+            pthread_mutex_lock(&video_cmd_thread_mutex);
+            pthread_cond_broadcast(&video_cmd_thread_cond);
+            pthread_mutex_unlock(&video_cmd_thread_mutex);
+        }
+
+        if(unBlockingFlag){
+            bPauseThread = false;
+            pthread_mutex_lock(&video_wait_thread_mutex);
+            pthread_cond_broadcast(&video_wait_thread_cond);
+            pthread_mutex_unlock(&video_wait_thread_mutex);
+        }
+
+        if(video_status == VIDEO_PAUSE) continue;
+
+
         clock_arr[0] = clock();//----------------------------------------------------------------------------------------------------------
 
         result = av_read_frame(fmt_ctx, pkt);
@@ -626,7 +802,9 @@ SendAgain:
             time_tmp = clock();
             usleep(100);
         }
-        printf("time:%f cnt:%d\n",(double)(time_tmp - time)/CLOCKS_PER_SEC,cnt);
+
+        // printf("time:%f cnt:%d\n",(double)(time_tmp - time)/CLOCKS_PER_SEC,cnt);
+
         time = time_tmp;
         if (result < 0){
             // result = _sendStream2Dec(pkt,true);
@@ -635,11 +813,38 @@ SendAgain:
         else {
             if (pkt->pts == AV_NOPTS_VALUE)
                 pkt->pts = pkt->dts = i;
-            result = _sendStream2Dec(pkt,false);
             cnt++;
         }
 
-        av_packet_unref(pkt);
+        if(video_type){
+            pts = pkt->pts;
+            // int pts = i;
+            pos = 0;
+            result = av_bsf_send_packet(h264bsfc, pkt);
+            if(result < 0){
+                printf("av_bsf_send_packet error\n");
+                goto finish;
+            } 
+            while (av_bsf_receive_packet(h264bsfc, pkt) == 0)
+            {
+                size_t packet_size = pkt->size;
+                if (pos + packet_size > h264_fr_buf_size){
+                    printf("packet size %ld\n",pos + packet_size);
+                    printf("packet size out of h264_fr_buf_size!!!\n");
+                    av_packet_unref(pkt);
+                    goto finish;
+                }
+                memcpy(h264_fr_buf + pos, pkt->data, packet_size);
+                pos += packet_size;  // 更新写入位置
+                av_packet_unref(pkt);
+            }
+            // printf("<pts:%d>",pts);
+            result = _sendStream2Dec( pos, h264_fr_buf, pts,false);
+        }
+        else {
+            result = _sendStream2Dec(pkt->size,pkt->data,pkt->pts,false);
+            av_packet_unref(pkt);
+        }
 
         if (result < 0) {
             av_log(NULL, AV_LOG_ERROR, "Error submitting a packet for decoding\n");
@@ -668,6 +873,98 @@ finish:
     // av_freep(&byte_buffer);
     // sws_freeContext(my_SwsContext);
     pthread_exit(NULL);
+}
+_UNUSED static void *input_ctrl()
+{
+    struct termios oldt, newt;
+    char cmd[4];
+    int bytes_read;
+
+    bool set_video_status_flag = false;
+    video_status_ctl_typedef _video_status_ctl;
+
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO);
+    // newt.c_lflag &= ~(ICANON);
+    newt.c_cc[VTIME] = 0;
+    newt.c_cc[VMIN] = 1;
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+
+    printf("enter input ctl thread\n");
+
+    while (bStopCtl == false) {
+        thread_wait_cmd_down(&video_cmd_thread_mutex,&video_cmd_thread_cond,&bWaitCmdDownCtl);
+        set_video_status_flag = false;
+
+        bytes_read = read(STDIN_FILENO, cmd, 4);
+        if (bytes_read == -1) {
+            perror("read");
+            break;
+        }
+
+        printf("recv:");
+        for(int i = 0; i< bytes_read; i++)
+            printf("%x",cmd[i]);
+        printf("\n");
+
+        _video_status_ctl.en = false;
+
+        if(bytes_read == 1)
+            switch (cmd[0]) {
+                case 'p':
+                    set_video_status_flag = true;
+                    if(_video_status_ctl.status == VIDEO_PLAYING)
+                        set_video_status_ctl_val(true,VIDEO_PAUSE,0,&_video_status_ctl);
+                    else if(_video_status_ctl.status == VIDEO_PAUSE)
+                        set_video_status_ctl_val(true,VIDEO_PLAYING,0,&_video_status_ctl);
+                    break;
+                case 'q':
+                    // 退出循环
+                    bStopCtl = true;
+                    goto end;
+                default:
+                    // 其他按键
+                    break;
+            }
+        else if(bytes_read == 3 && strncmp(cmd,"\x1b[",2) == 0)
+            switch (cmd[2]) {
+                case 'A':
+                    printf("Up arrow pressed\n");
+                    break;
+                case 'B':
+                    printf("Down arrow pressed\n");
+                    break;
+                case 'C':
+                    printf("VIDEO FORWARD %ds!!\n",VIDEO_FORWARD_SECONDS);
+                    set_video_status_flag = true;
+                    set_video_status_ctl_val(true,VIDEO_FORWARD,VIDEO_FORWARD_SECONDS,&_video_status_ctl);
+                    break;
+                case 'D':
+                    printf("VIDEO BACK %ds!!\n",VIDEO_BACK_SECONDS);
+                    set_video_status_flag = true;
+                    set_video_status_ctl_val(true,VIDEO_BACK,VIDEO_BACK_SECONDS,&_video_status_ctl);
+                    break;
+                default:
+                    // 其他按键
+                    break;
+            }
+        
+        if(set_video_status_flag){
+            set_video_status_flag = false;
+            pthread_mutex_lock(&video_status_ctl_mutex);
+
+            memcpy(&video_status_ctl,&_video_status_ctl,sizeof(video_status_ctl_typedef));
+            bWaitCmdDownCtl = true;
+
+            pthread_mutex_unlock(&video_status_ctl_mutex);
+        }
+
+    }
+
+end:
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    return NULL;
 }
 
 int main(int argc, char *argv[]){
@@ -736,17 +1033,20 @@ int main(int argc, char *argv[]){
 
 	vdecThreadParm.eThreadCtrl = THREAD_CTRL_START;
 	_UNUSED pthread_t getDstImgThread, getSrcImgThread, sendStreamThread, getDecImgThread;
+    _UNUSED pthread_t inputCtrlThread;
 	// SAMPLE_COMM_VDEC_StartSendStream( &vdecThreadParm, &sendStreamThread);
     startVdecFrameSendThread(&sendStreamThread,&vdecThreadParm);
     pthread_create(&getDstImgThread, NULL, getDstImg, NULL);
-    pthread_create(&getSrcImgThread, NULL, getSrcImg, NULL);
+    // startGetdecThread(&getDstImgThread,getDstImg);
+    // pthread_create(&getSrcImgThread, NULL, getSrcImg, NULL);
     pthread_create(&getDecImgThread, NULL, getDecImg, NULL);
+    pthread_create(&inputCtrlThread, NULL, input_ctrl, NULL);
 
 	printf("vdec get pic start!\n");
 	// SAMPLE_COMM_VDEC_StartGetPic( &vdecThreadParm, &getDecPicThread);
 
     pthread_join(getDstImgThread, NULL);
-    pthread_join(getSrcImgThread, NULL);
+    // pthread_join(getSrcImgThread, NULL);
     bReleaseSendFrame = true;
     pthread_join(sendStreamThread, NULL);
     printf("exit all thread down\n");
