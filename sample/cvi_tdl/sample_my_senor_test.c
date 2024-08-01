@@ -194,21 +194,18 @@ UNUSED static void lcd_show_rgb565_384_288(char *dstAddr, VIDEO_FRAME_INFO_S stF
   stFrame.stVFrame.pu8VirAddr[2] =
       stFrame.stVFrame.pu8VirAddr[1] + stFrame.stVFrame.u32Length[1];
       
-  UNUSED unsigned short color_rgb565;
   UNUSED unsigned char *u8_rgb888_data = stFrame.stVFrame.pu8VirAddr[0];
-  UNUSED uint16_t * fbp_16 = (uint16_t *) dstAddr;
-    /* 384 * 288 */
-  long index = 0;
-  long lcd_index = 0;
-  for (uint16_t iy = 0; iy < 288; iy ++) {
-    for (uint16_t ix = 0; ix < 384; ix ++) {
-        color_rgb565 = ((u8_rgb888_data[index]&0xf8)<<8)|((u8_rgb888_data[index + 1]&0xfc)<<3)|((u8_rgb888_data[index + 2]&0xf8)>>3);
-        fbp_16[lcd_index] = color_rgb565;
-        lcd_index++;
-        index += 3;
+
+    int width = (stFrame.stVFrame.u32Width > 480)?480:stFrame.stVFrame.u32Width;    
+    int height = (stFrame.stVFrame.u32Height > 320)?320:stFrame.stVFrame.u32Height;    
+    int data_size = width*3;
+    int lcd_pitch = 480*3;
+
+    for (int i = 0; i < height; i++) {
+        memcpy( dstAddr, u8_rgb888_data, data_size);
+        dstAddr += lcd_pitch;
+        u8_rgb888_data += data_size;
     }
-    lcd_index += (480-384);
-  }
 
   CVI_SYS_Munmap((void *)stFrame.stVFrame.pu8VirAddr[0], image_size);
   stFrame.stVFrame.pu8VirAddr[0] = NULL;
